@@ -15,12 +15,40 @@ namespace mesh {
   uint32_t mesh::BridgeFilter::bridgefilter_stats_rx_blocked = 0;
   uint32_t mesh::BridgeFilter::bridgefilter_stats_htag_blocked[BRIDGE_FILTER_BLOCKEDHTAGS_MAX] = { 0};
 
-  // https://emn178.github.io/online-tools/sha256.html
-  // Private key of Public channel: 8b3387e9c5cdea6ac9e5edbaa115cd72
-  // SHA256=>1155f1870f91778646972b7bde747d989cf9f95416b50829666036563365424d
-  // First byte is 0x11
+  // Known key of the "Public" channel: 8b3387e9c5cdea6ac9e5edbaa115cd72, channel hash 0x11.
+  static const uint8_t PUBLIC_CHANNEL_SECRET[PUB_KEY_SIZE] = {
+    0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a, 0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72
+  };
+  static const uint8_t PUBLIC_CHANNEL_HASH = 0x11;
 
-  // Payload : 11 5D4A8A5FA5912A52244139E36F0BB43612967906F13DE5692C1030885AECF285AD9B
+  uint8_t BridgeFilter::channelHashByte(const uint8_t secret[PUB_KEY_SIZE]) {
+    static const uint8_t zeroes[16] = { 0 };
+    uint8_t hash[PATH_HASH_SIZE];
+    // 128-bit keys (hashtag channels, Public) hash the first 16 bytes; 256-bit keys all 32
+    int key_len = (memcmp(&secret[16], zeroes, 16) == 0) ? 16 : 32;
+    Utils::sha256(hash, sizeof(hash), secret, key_len);
+    return hash[0];
+  }
+
+  namespace {
+    // Hash byte of each blocked hashtag key, derived on demand so the saved policy
+    // struct keeps its shape. A slot is recomputed whenever its key changes.
+    struct HashByteCache {
+      uint8_t key[BRIDGE_FILTER_BLOCKEDHTAGS_MAX][PUB_KEY_SIZE];
+      uint8_t hash[BRIDGE_FILTER_BLOCKEDHTAGS_MAX];
+      bool valid[BRIDGE_FILTER_BLOCKEDHTAGS_MAX] = { false };
+      uint8_t get(const BridgeFilter::BridgeFilterPolicy& policy, uint8_t i) {
+        if (!valid[i] || memcmp(key[i], policy.blockedPSKs[i], PUB_KEY_SIZE) != 0) {
+          memcpy(key[i], policy.blockedPSKs[i], PUB_KEY_SIZE);
+          hash[i] = BridgeFilter::channelHashByte(policy.blockedPSKs[i]);
+          valid[i] = true;
+        }
+        return hash[i];
+      }
+    };
+    HashByteCache htag_hashes;
+  }
+
   bool BridgeFilter::isPacketAllowed(const BridgeFilterPolicy& policy, mesh::Packet *pkt) {
     BRIDGEFILTER_DEBUG_PRINTLN("Payload type: %s, first byte: %02x", pkt->getPayloadTypeText(), pkt->payload[0]);
 
@@ -30,52 +58,39 @@ namespace mesh {
       return false; // Drop
     }
 
+    if (pkt->getPayloadType() != PAYLOAD_TYPE_GRP_TXT || pkt->payload_len < 1) {
+      return true; // Only group messages are filtered by channel
+    }
+    uint8_t channel_hash = pkt->payload[0];
+
     // Drop message based on first-byte channel hash
-    if (pkt->getPayloadType() == PAYLOAD_TYPE_GRP_TXT) {
-      if (isBlockedFirstByte(policy, pkt->payload[0])) {
-        BRIDGEFILTER_DEBUG_PRINTLN("First-byte message");
-        return false; // Drop
-      }
+    if (isBlockedFirstByte(policy, channel_hash)) {
+      BRIDGEFILTER_DEBUG_PRINTLN("First-byte message");
+      return false; // Drop
     }
 
-    // Drop message from channels
-    if (pkt->getPayloadType() == PAYLOAD_TYPE_GRP_TXT) {
-      if (pkt->payload[0] == 0x11) { // "Public" channel?
-        // Known public key of "Public" channel
-        uint8_t shared_secret[PUB_KEY_SIZE] = { 0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
-                                                0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72 };
-        uint8_t dest[MAX_PACKET_PAYLOAD];
-        int len = mesh::Utils::MACThenDecrypt(shared_secret, dest, &pkt->payload[1], pkt->payload_len - 1);
-        if (len > 0) { // Able to decode
-          // Public message but not blocked
-          if (!isPublicBlocked(policy)) {
-            return true;
-          }
-
-          BRIDGEFILTER_DEBUG_PRINTLN("Public message, %d bytes", len);
-          return false; // Block
-        } else {        // Failed to decode
-          BRIDGEFILTER_DEBUG_PRINTLN("Not Public message");
-        }
-      } else { // Check for blocked Hashtags
-        for (int i = 0; i < policy.blockedHTagCount; i++) {
-          // Get Hashtag name
-          const char* hashtag = policy.blockedHTags[i];
-
-          uint8_t dest[MAX_PACKET_PAYLOAD];
-          int len = mesh::Utils::MACThenDecrypt(policy.blockedPSKs[i], dest, &pkt->payload[1], pkt->payload_len - 1);
-          if (len > 0) { // Able to decode
-            BRIDGEFILTER_DEBUG_PRINTLN("Hashtag %s message, %d bytes", hashtag, len);
-
-            // Statistics
-            bridgefilter_stats_htag_blocked[i]++;
-            return false; // Block
-          } else {
-            BRIDGEFILTER_DEBUG_PRINTLN("Not hashtag %s message", hashtag);
-          }
-        }
-      } // End of check for blocked Hashtags
-    } // End of drop message from channels
+    // Drop messages of blocked channels: only keys whose hash byte matches are tried.
+    // Every blocked key is tried, including when the hash byte is Public's (0x11).
+    uint8_t dest[MAX_PACKET_PAYLOAD];
+    if (isPublicBlocked(policy) && channel_hash == PUBLIC_CHANNEL_HASH) {
+      int len = mesh::Utils::MACThenDecrypt(PUBLIC_CHANNEL_SECRET, dest, &pkt->payload[1], pkt->payload_len - 1);
+      if (len > 0) { // Public message
+        BRIDGEFILTER_DEBUG_PRINTLN("Public message, %d bytes", len);
+        return false; // Block
+      }
+      BRIDGEFILTER_DEBUG_PRINTLN("Not Public message");
+    }
+    for (uint8_t i = 0; i < policy.blockedHTagCount && i < BRIDGE_FILTER_BLOCKEDHTAGS_MAX; i++) {
+      if (htag_hashes.get(policy, i) != channel_hash) continue; // not this channel
+      const char* hashtag = policy.blockedHTags[i];
+      int len = mesh::Utils::MACThenDecrypt(policy.blockedPSKs[i], dest, &pkt->payload[1], pkt->payload_len - 1);
+      if (len > 0) { // Able to decode
+        BRIDGEFILTER_DEBUG_PRINTLN("Hashtag %s message, %d bytes", hashtag, len);
+        bridgefilter_stats_htag_blocked[i]++; // Statistics
+        return false; // Block
+      }
+      BRIDGEFILTER_DEBUG_PRINTLN("Not hashtag %s message", hashtag);
+    }
 
     return true; // Allow if reach here
   } // isPacketAllowed

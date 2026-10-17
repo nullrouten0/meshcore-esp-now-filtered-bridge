@@ -39,6 +39,10 @@ namespace mesh {
 
     // Policy
     static bool isPacketAllowed(const BridgeFilterPolicy& policy, mesh::Packet *pkt);
+
+    // First byte of the channel hash MeshCore puts in front of every group message
+    // for this channel secret (same rule as BaseChatMesh::setChannel).
+    static uint8_t channelHashByte(const uint8_t secret[PUB_KEY_SIZE]);
     static bool isPolicyEnabled(const BridgeFilterPolicy &policy) {
       return policy.policy > 0 || policy.blockedFirstBytesCount > 0 || policy.blockedHTagCount > 0;
     }
